@@ -1,0 +1,14 @@
+# making a virtual environment using venv
+python3 -m venv venv
+
+# activate 
+source venv/bin/activate
+
+# download all requirements
+pip install -r requirements.txt 
+
+# freeze all packages 
+pip freeze > requirements.txt
+
+# deactivate
+deactivate
