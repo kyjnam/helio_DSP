@@ -1,4 +1,15 @@
 # good morning!
+import re
+import gzip
+import io
+import os
+import requests
+import numpy as np
+from datetime import datetime, timedelta
+from bs4 import BeautifulSoup
+from astropy.io import fits
+from urllib.parse import urljoin
+from tqdm import tqdm
 
 def get_date_directory_url(year, month, day):
     """
@@ -19,20 +30,7 @@ def get_date_directory_url(year, month, day):
     
     return directory_url
 
-# --- Example ---
-year_to_find = 2023
-month_to_find = 1
-day_to_find = 15
-
-url = get_date_directory_url(year_to_find, month_to_find, day_to_find)
-print(f"The URL for {month_to_find}/{year_to_find} is: {url}")
-
-# --------------------
-import requests
-from bs4 import BeautifulSoup
-import re
-
-def get_files_for_day_interactive(year, month, day):
+def get_files_for_day(year, month, day):
     """
     Finds available stations for a day, prompts the user to choose one,
     and returns all corresponding file URLs for that day.
@@ -44,7 +42,7 @@ def get_files_for_day_interactive(year, month, day):
     day_str = str(day).zfill(2)
 
     base_url = "https://soleil.i4ds.ch/solarradio/data/2002-20yy_Callisto" # the base URL for the data archive
-    dir_url = f"{base_url}/{year}/{month_str}/{day_str}" # create the full directory URL
+    dir_url = f"{base_url}/{year}/{month_str}/{day_str}/" # create the full directory URL
 
     date_to_match = f"{year}{month_str}{day_str}"
     
@@ -103,25 +101,186 @@ def get_files_for_day_interactive(year, month, day):
         if filename.startswith(f"{selected_station}_{date_to_match}"):
             final_urls.append(f"{dir_url}{filename}")
             
-    return final_urls
+    return final_urls, selected_station
 
-# --- Example of how to run the functions together ---
 
-# Set the date you are interested in
-year = 2024
-month = 7
-day = 20
 
-# Run the interactive function
-file_links = get_files_for_day_interactive(year, month, day)
+def files_to_numpy(station: str, year: str, month: str, day: str, time_offset: str = "000000"):
+    """
+    Downloads and processes e-CALLISTO files into a single NumPy array with a progress bar.
+    """
+    # --- Convert string inputs to integers for formatting ---
+    year = int(year)
+    month = int(month)
+    day = int(day)
 
-# Print the results
-if isinstance(file_links, list):
-    print("\n--- Found Files ---")
-    for link in file_links:
-        print(link)
-    print(f"\nTotal: {len(file_links)} files.")
-else:
-    # This will print any error messages
-    print(file_links)
+    # --- 1. Get and Filter File List ---
+    base_url = "https://soleil.i4ds.ch/solarradio/data/2002-20yy_Callisto/"
+    
+    # CORRECTED PATH: The server directory is structured by Year/Month, not Year/Month/Day
+    path = f"{year:04d}/{month:02d}/{day:02d}/"
+    dir_url = urljoin(base_url, path)
+    date_str_match = f"{year:04d}{month:02d}{day:02d}"
+
+    try:
+        response = requests.get(dir_url)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, "html.parser")
+    except requests.RequestException as e:
+        print(f"Error: Could not access the directory at {dir_url}. Details: {e}")
+        return None, None
+
+    all_files = [urljoin(dir_url, a['href']) for a in soup.find_all('a', href=True)]
+    
+    station_files = [
+        f for f in all_files 
+        if station in f and date_str_match in f and f.endswith(".fit.gz")
+    ]
+
+    if not station_files:
+        print(f"Error: No files found for station '{station}' on {year}-{month}-{day} at {dir_url}")
+        return None, None
+
+    # --- 2. Circularly Sort Files by Time ---
+    def hhmmss_to_seconds(hhmmss: str) -> int:
+        h, m, s = int(hhmmss[:2]), int(hhmmss[2:4]), int(hhmmss[4:6])
+        return h * 3600 + m * 60 + s
+
+    time_re = re.compile(r"_(\d{6})[i_]")
+    time_file_pairs = []
+    for f_url in station_files:
+        match = time_re.search(f_url)
+        if match:
+            t = hhmmss_to_seconds(match.group(1))
+            time_file_pairs.append((t, f_url))
+    
+    time_file_pairs.sort(key=lambda x: x[0])
+    offset_sec = hhmmss_to_seconds(time_offset)
+    times = [t for t, _ in time_file_pairs]
+    idx = next((i for i, t in enumerate(times) if t >= offset_sec), 0)
+    sorted_urls = [f for _, f in time_file_pairs[idx:]] + [f for _, f in time_file_pairs[:idx]]
+
+    # --- 3. Process Files into NumPy arrays ---
+    data_chunks = []
+    overall_start_time, overall_end_time = None, None
+
+    # The loop is now wrapped in tqdm() to create the progress bar
+    for url in tqdm(sorted_urls, desc=f"Processing files for {station}"):
+        try:
+            r = requests.get(url, stream=True)
+            r.raise_for_status()
+            with gzip.GzipFile(fileobj=io.BytesIO(r.content)) as gz:
+                with fits.open(io.BytesIO(gz.read())) as hdul:
+                    data = hdul[0].data
+                    if data.ndim == 1:
+                        data = np.atleast_2d(data)
+                    data_chunks.append(np.array(data, dtype=np.float32))
+
+                    header = hdul[0].header
+                    start_str = f"{header['DATE-OBS']} {header['TIME-OBS']}"
+                    end_date_str, end_time_str = header['DATE-END'], header['TIME-END']
+                    
+                    current_start = datetime.fromisoformat(start_str.replace('/', '-'))
+                    if end_time_str.startswith("24:00"):
+                        current_end = datetime.fromisoformat(end_date_str.replace('/', '-')) + timedelta(days=1)
+                    else:
+                        current_end = datetime.fromisoformat(f"{end_date_str.replace('/', '-')} {end_time_str}")
+
+                    if overall_start_time is None or current_start < overall_start_time:
+                        overall_start_time = current_start
+                    if overall_end_time is None or current_end > overall_end_time:
+                        overall_end_time = current_end
+        except Exception as e:
+            # Using tqdm.write is better for printing during a loop
+            tqdm.write(f"\nWarning: Skipping file {os.path.basename(url)} due to error: {e}")
+            continue
+
+    if not data_chunks:
+        print("Error: No valid FITS data could be processed.")
+        return None, None
+
+    # --- 4. Standardize Dimensions and Concatenate ---
+    max_freq_bins = max(chunk.shape[0] for chunk in data_chunks)
+    
+    padded_chunks = []
+    for chunk in data_chunks:
+        if chunk.shape[0] < max_freq_bins:
+            padding_height = max_freq_bins - chunk.shape[0]
+            pad_block = np.full((padding_height, chunk.shape[1]), np.nan, dtype=np.float32)
+            padded_chunk = np.vstack([chunk, pad_block])
+            padded_chunks.append(padded_chunk)
+        else:
+            padded_chunks.append(chunk)
+
+    full_spectrogram = np.concatenate(padded_chunks, axis=1)
+    full_spectrogram = np.flipud(full_spectrogram)
+
+    metadata = {
+        "station": station,
+        "date": f"{year}-{month:02d}-{day:02d}",
+        "start_time": overall_start_time,
+        "end_time": overall_end_time,
+        "files_processed": len(data_chunks),
+        "shape": full_spectrogram.shape,
+        "frequency_bins": full_spectrogram.shape[0],
+        "time_steps": full_spectrogram.shape[1]
+    }
+    
+    return full_spectrogram, metadata
+
+import numpy as np
+import os # Make sure os is imported
+
+def save_numpy_array(data_array, metadata):
+    """
+    Saves a NumPy array to a .npy file with a descriptive name.
+
+    Args:
+        data_array (np.ndarray): The final aggregated NumPy array.
+        metadata (dict): The summary metadata dictionary.
+    """
+    # Create an organized folder path, e.g., "data/ALASKA-ANCHORAGE/"
+    save_path = os.path.join("data", metadata['station'])
+    os.makedirs(save_path, exist_ok=True) # Ensure the directory exists
+
+    # Construct a descriptive filename, e.g., "ALASKA-ANCHORAGE_2024-07-20.npy"
+    filename = f"{metadata['station']}_{metadata['date']}.npy"
+    full_filepath = os.path.join(save_path, filename)
+
+    try:
+        print(f"\nSaving data to {full_filepath}...")
+        # Use NumPy's save function for efficient, binary storage
+        np.save(full_filepath, data_array)
+        print("Save complete.")
+    except Exception as e:
+        print(f"Error saving file: {e}")
+
+if __name__ == "__main__":
+    # Set the date you are interested in
+    year = 2024
+    month = 7
+    day = 20
+
+    # url = get_date_directory_url(year, month, day)
+    # print(f"The URL for {year}/{month}/{day} is: {url}")
+
+    file_links, station_name = get_files_for_day(year, month, day)
+
+    # Print the results
+    if isinstance(file_links, list):
+        # Call the processing function as before
+        final_numpy_array, summary_metadata = files_to_numpy(station_name, year, month, day)
+
+        # If processing was successful, print the summary and save the file
+        if final_numpy_array is not None:
+            print("\n--- Processing Complete ---")
+            print(f"Station: {summary_metadata['station']}")
+            print(f"Date: {summary_metadata['date']}")
+            print(f"Final array shape: {final_numpy_array.shape}")
+            
+            # --- NEW: Call the save function here ---
+            save_numpy_array(final_numpy_array, summary_metadata)
+    else:
+        # This will print any error messages
+        print(file_links)
 

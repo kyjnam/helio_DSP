@@ -1,2 +1,6 @@
 requests 
 beautifulsoup4
+astropy 
+numpy
+tqdm
+matplotlib
