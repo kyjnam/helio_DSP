@@ -1,0 +1,15 @@
+--- Frequency Info ---
+FITS Keywords:
+  CRVAL2 (Start Freq): 200.0 MHz
+  CDELT2 (Step Freq):  -1.0 MHz
+  NAXIS2 (Num Bins):   200
+
+Calculated Range:
+  Bin 0 = 200.00 MHz
+  Bin 199 = 1.00 MHz
+
+  Total Duration:     1439.99 minutes
+
+STEPS PER MINUTE: 189.96 = 190
+
+total duration 1440 minutes = 24 hours
